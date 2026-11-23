@@ -59,6 +59,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import de.bjoern.tamagotchi.TamagotchiBle.Status
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /** Haelt die BLE-Verbindung ueber Bildschirmdrehungen hinweg. */
@@ -123,11 +124,22 @@ fun TamagotchiScreen(ble: TamagotchiBle) {
 
             LcdPreview(
                 line1 = state.lcdText,
-                line2 = if (connected) "BLE: verbunden" else "BLE: wartet...",
+                line2 = when {
+                    !connected -> "BLE --"
+                    state.batteryPercent == null -> "BLE ok"
+                    else -> String.format(Locale.ROOT, "BLE ok Akku%4d%%", state.batteryPercent)
+                },
                 brightness = state.brightness,
             )
 
-            Text(state.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                buildString {
+                    append(state.message)
+                    state.batteryPercent?.let { append(" · Akku $it %") }
+                    state.batteryMv?.let { append(" ($it mV)") }
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             if (!hasPermissions) {
                 Button(

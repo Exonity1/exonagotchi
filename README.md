@@ -46,7 +46,7 @@ Ein selbstgebautes Tamagotchi im Y2K-Look: ein klassisches 16x2-LCD, ein ESP32 u
 
 - [x] Display + dimmbares Backlight
 - [x] BLE-Steuerung per Android-App
-- [ ] Akkubetrieb mit Step-up und Akkustand-Anzeige
+- [x] Akkubetrieb mit Step-up und Akkustand-Anzeige
 - [ ] Pet: Pixel-Figur, Animationen, Hunger und Laune
 - [ ] Gehaeuse (3D-Druck, transparent blau)
 - [ ] Eigenes PCB als Display-Rucksack

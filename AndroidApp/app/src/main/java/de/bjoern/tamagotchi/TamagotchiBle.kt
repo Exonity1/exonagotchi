@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
@@ -24,7 +25,7 @@ import java.util.UUID
 
 /**
  * Verbindung zum ESP32-Tamagotchi.
- * Muss zur Firmware passen (src/main.cpp): gleiche UUIDs, gleicher Geraetename.
+ * Muss zur Firmware passen (siehe PROTOCOL.md): gleiche UUIDs, gleicher Geraetename.
  */
 @SuppressLint("MissingPermission") // Berechtigungen werden in MainActivity geprueft
 class TamagotchiBle(private val context: Context) {
@@ -34,6 +35,13 @@ class TamagotchiBle(private val context: Context) {
         val SERVICE_UUID: UUID = UUID.fromString("7a6d0001-5f3c-4a8e-9b1d-2c4e6f8a0b1c")
         val LIGHT_UUID: UUID = UUID.fromString("7a6d0002-5f3c-4a8e-9b1d-2c4e6f8a0b1c")
         val TEXT_UUID: UUID = UUID.fromString("7a6d0003-5f3c-4a8e-9b1d-2c4e6f8a0b1c")
+        val VOLTAGE_UUID: UUID = UUID.fromString("7a6d0004-5f3c-4a8e-9b1d-2c4e6f8a0b1c")
+
+        // Standard-Bluetooth: Battery Service / Battery Level / Notify-Descriptor
+        val BATTERY_SERVICE_UUID: UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+        val BATTERY_LEVEL_UUID: UUID = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
         private const val SCAN_TIMEOUT_MS = 10_000L
         const val MAX_TEXT = 16
     }
@@ -45,6 +53,8 @@ class TamagotchiBle(private val context: Context) {
         val message: String = "Nicht verbunden",
         val brightness: Int = 255,
         val lcdText: String = "Hallo Welt!",
+        val batteryPercent: Int? = null,
+        val batteryMv: Int? = null,
     )
 
     private val _state = MutableStateFlow(State())
@@ -58,8 +68,15 @@ class TamagotchiBle(private val context: Context) {
     private var lightChr: BluetoothGattCharacteristic? = null
     private var textChr: BluetoothGattCharacteristic? = null
 
-    // BLE erlaubt nur eine Operation gleichzeitig -> kleine Warteschlange
-    private val queue = ArrayDeque<Pair<BluetoothGattCharacteristic, ByteArray>>()
+    // BLE erlaubt nur eine Operation gleichzeitig -> Warteschlange fuer Lesen, Schreiben, Notify
+    private sealed interface Op {
+        val chr: BluetoothGattCharacteristic
+        class Write(override val chr: BluetoothGattCharacteristic, val value: ByteArray) : Op
+        class Read(override val chr: BluetoothGattCharacteristic) : Op
+        class EnableNotify(override val chr: BluetoothGattCharacteristic) : Op
+    }
+
+    private val queue = ArrayDeque<Op>()
     private var busy = false
 
     val isBluetoothOn: Boolean get() = adapter?.isEnabled == true
@@ -139,6 +156,7 @@ class TamagotchiBle(private val context: Context) {
             queue.clear()
             busy = false
         }
+        _state.update { it.copy(batteryPercent = null, batteryMv = null) }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -171,12 +189,19 @@ class TamagotchiBle(private val context: Context) {
             textChr = service.getCharacteristic(TEXT_UUID)
             setStatus(Status.CONNECTED, "Verbunden")
 
-            // Aktuelle Helligkeit vom Geraet lesen, damit der Regler stimmt
-            lightChr?.let { c ->
-                synchronized(queue) { busy = true }
-                if (!g.readCharacteristic(c)) {
-                    synchronized(queue) { busy = false }
-                }
+            // Aktuelle Helligkeit lesen, damit der Regler stimmt
+            lightChr?.let { enqueue(Op.Read(it)) }
+
+            // Rohe Akkuspannung in mV lesen und abonnieren
+            service.getCharacteristic(VOLTAGE_UUID)?.let {
+                enqueue(Op.Read(it))
+                enqueue(Op.EnableNotify(it))
+            }
+
+            // Akkustand lesen und Aenderungen abonnieren (Firmware sendet per Notify)
+            g.getService(BATTERY_SERVICE_UUID)?.getCharacteristic(BATTERY_LEVEL_UUID)?.let {
+                enqueue(Op.Read(it))
+                enqueue(Op.EnableNotify(it))
             }
         }
 
@@ -186,23 +211,39 @@ class TamagotchiBle(private val context: Context) {
             value: ByteArray,
             status: Int,
         ) {
-            if (status == BluetoothGatt.GATT_SUCCESS &&
-                characteristic.uuid == LIGHT_UUID && value.isNotEmpty()
-            ) {
-                val b = value[0].toInt() and 0xFF
-                _state.update { it.copy(brightness = b) }
-            }
-            synchronized(queue) { busy = false }
-            next()
+            if (status == BluetoothGatt.GATT_SUCCESS) handleValue(characteristic.uuid, value)
+            opDone()
         }
 
         override fun onCharacteristicWrite(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             status: Int,
-        ) {
-            synchronized(queue) { busy = false }
-            next()
+        ) = opDone()
+
+        override fun onDescriptorWrite(
+            g: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+        ) = opDone()
+
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+        ) = handleValue(characteristic.uuid, value)
+    }
+
+    private fun handleValue(uuid: UUID, value: ByteArray) {
+        if (value.isEmpty()) return
+        val b = value[0].toInt() and 0xFF
+        when (uuid) {
+            LIGHT_UUID -> _state.update { it.copy(brightness = b) }
+            BATTERY_LEVEL_UUID -> _state.update { it.copy(batteryPercent = b.coerceIn(0, 100)) }
+            VOLTAGE_UUID -> if (value.size >= 2) {
+                val mv = b or ((value[1].toInt() and 0xFF) shl 8)  // uint16 little-endian
+                _state.update { it.copy(batteryMv = mv) }
+            }
         }
     }
 
@@ -213,14 +254,14 @@ class TamagotchiBle(private val context: Context) {
         _state.update { it.copy(brightness = v) }
         val c = lightChr ?: return
         // Beim Schieben nur den neuesten Wert senden, alte verwerfen
-        enqueue(c, byteArrayOf(v.toByte()), replacePending = true)
+        enqueue(Op.Write(c, byteArrayOf(v.toByte())), replacePending = true)
     }
 
     fun sendText(raw: String) {
         val text = toLcdText(raw)
         _state.update { it.copy(lcdText = text) }
         val c = textChr ?: return
-        enqueue(c, text.toByteArray(Charsets.US_ASCII), replacePending = true)
+        enqueue(Op.Write(c, text.toByteArray(Charsets.US_ASCII)), replacePending = true)
     }
 
     /** Das Display kann nur ASCII: Umlaute ersetzen, Rest filtern, auf 16 Zeichen kuerzen. */
@@ -231,11 +272,18 @@ class TamagotchiBle(private val context: Context) {
         .filter { it.code in 0x20..0x7E }
         .take(MAX_TEXT)
 
-    private fun enqueue(c: BluetoothGattCharacteristic, value: ByteArray, replacePending: Boolean) {
+    // ---------- Warteschlange ----------
+
+    private fun enqueue(op: Op, replacePending: Boolean = false) {
         synchronized(queue) {
-            if (replacePending) queue.removeAll { it.first.uuid == c.uuid }
-            queue.addLast(c to value)
+            if (replacePending) queue.removeAll { it is Op.Write && it.chr.uuid == op.chr.uuid }
+            queue.addLast(op)
         }
+        next()
+    }
+
+    private fun opDone() {
+        synchronized(queue) { busy = false }
         next()
     }
 
@@ -244,13 +292,25 @@ class TamagotchiBle(private val context: Context) {
             if (busy) return
             val g = gatt ?: return
             while (true) {
-                val (c, value) = queue.removeFirstOrNull() ?: return
+                val op = queue.removeFirstOrNull() ?: return
                 busy = true
-                val result = g.writeCharacteristic(
-                    c, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                )
-                if (result == BluetoothStatusCodes.SUCCESS) return
-                busy = false // Schreiben abgelehnt -> naechsten Eintrag versuchen
+                val started = when (op) {
+                    is Op.Write -> g.writeCharacteristic(
+                        op.chr, op.value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == BluetoothStatusCodes.SUCCESS
+
+                    is Op.Read -> g.readCharacteristic(op.chr)
+
+                    is Op.EnableNotify -> {
+                        val cccd = op.chr.getDescriptor(CCCD_UUID)
+                        g.setCharacteristicNotification(op.chr, true) && cccd != null &&
+                            g.writeDescriptor(
+                                cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            ) == BluetoothStatusCodes.SUCCESS
+                    }
+                }
+                if (started) return
+                busy = false // abgelehnt -> naechste Operation versuchen
             }
         }
     }
